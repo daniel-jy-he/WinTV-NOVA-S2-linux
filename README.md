@@ -1,10 +1,12 @@
-# PCTV 461 (2013:0462) DVB-S2 on Raspberry Pi 5 — Problem, Investigation, and Fix
+# Hauppauge WinTV-NOVA-S2 PCTV 461 (2013:0462) DVB-S2 on Raspberry Pi 5 — Problem, Investigation, and Fix
 
 This documentation is for owners of the `WinTV-NOVA-S2` USB Tuner made by Hauppauge and are struggling to install on Linux.
 
 TLDR: The more recent versions use a require a driver which not present in the Linux build. There is a script called `run.sh` which will load the required drivers from the main Github Linux repository.
 
 If you're more interested, the steps below are used to identify the core issue. Look at step 3: `dmesg` and `lsusb` command outputs and `ls -l /dev/dvb/` throwing 'not found' are clear indicators that you have the problem.
+
+Note: these instructions worked for my Raspberry Pi 5 running Debian 6.18.39.
 
 ## 0. The issue
 
