@@ -420,3 +420,39 @@ sudo modprobe em28xx
 This removes only the locally-built replacement modules; the installed kernel and
 its original modules are untouched throughout this entire process, so this rollback
 is always safe.
+
+## 11. Automatic re-build at boot (dvb-boot-check)
+
+On this machine the build is re-run automatically when it is needed, not by
+hand. A systemd timer (`dvb-boot-check.timer`) runs
+`/usr/local/sbin/dvb-boot-check.sh` ~30 seconds after every boot; step 1 of
+that check tests whether the custom `em28xx`/`m88ds3103` modules are installed
+for the *currently running* kernel:
+
+```sh
+MODULES_BUILT() {
+    [ -f "/lib/modules/$1/updates/usb/em28xx/em28xx.ko" ] &&
+    [ -f "/lib/modules/$1/updates/dvb-frontends/m88ds3103.ko" ]
+}
+```
+
+If they are missing (i.e. the kernel was upgraded since the last build — a
+situation that *silently* drops the PCTV 461e v3 support, see section 0), the
+check runs `run.sh` as the normal `daniel` user. It then re-checks the
+firmware, USB ID `2013:0462`, `/dev/dvb` nodes, starts `dvb-node`, and requires
+a real Astra 28.2E tune lock. On total failure it marks the tuner
+`FIRMWARE_FAILED` so the tv-server dashboard shows the real state instead of a
+misleading blank/IDLE.
+
+Notes:
+
+- `run.sh` still needs a *clean* environment to succeed (e.g. no half-finished
+  build from a previous interrupted run). The boot check treats a failed build
+  + failed tune as FAIL and records the reason in `journalctl -u dvb-boot-check`.
+- `run.sh` pins to the known-good commit recorded in
+  `~/em28xx-known-good-commit.txt` (section 6). A new kernel does not change
+  that pin — it just triggers a rebuild of the *same* pinned source against the
+  *new* kernel headers.
+- Run the check manually at any time:
+  `sudo systemctl start dvb-boot-check.service`, then
+  `journalctl -u dvb-boot-check -e` to see the result.

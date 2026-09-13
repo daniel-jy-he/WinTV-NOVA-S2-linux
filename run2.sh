@@ -60,6 +60,43 @@ command -v sudo >/dev/null 2>&1 || die "sudo is required but not found."
 RUNNING_KERNEL="$(uname -r)"
 log "Detected running kernel: ${RUNNING_KERNEL}"
 
+# ---------------------------------------------------------------------
+# Kernel-age guard: the driver source this script fetches is current
+# mainline (~2026). A kernel more than ~a year old is likely to have
+# real API differences (renamed functions, changed signatures) rather
+# than just missing headers. Missing headers are self-fixable via
+# em28xx-extra-paths.txt; changed function signatures are NOT — those
+# need actual source patches, which this script deliberately does not
+# attempt to auto-generate (wrong patches in kernel module code risk
+# crashes, not just build failures). If you hit that wall, the known
+# fix is to update the kernel first, exactly as was done earlier in
+# this project (6.12.47 -> 6.18.39 via a normal apt upgrade):
+#     sudo apt update && sudo apt full-upgrade -y && sudo reboot
+# ---------------------------------------------------------------------
+KERNEL_BUILD_DATE_RAW="$(uname -v | grep -oE '[A-Z][a-z]{2} [A-Z][a-z]{2} +[0-9]+ [0-9:]+ [A-Z]+ [0-9]{4}' || true)"
+if [ -n "$KERNEL_BUILD_DATE_RAW" ]; then
+    KERNEL_BUILD_EPOCH="$(date -d "$KERNEL_BUILD_DATE_RAW" +%s 2>/dev/null || true)"
+    if [ -n "$KERNEL_BUILD_EPOCH" ]; then
+        AGE_DAYS=$(( ( $(date +%s) - KERNEL_BUILD_EPOCH ) / 86400 ))
+        if [ "$AGE_DAYS" -gt 365 ]; then
+            warn "Running kernel was built ${AGE_DAYS} days ago (${KERNEL_BUILD_DATE_RAW})."
+            echo "This script fetches current mainline driver source, which is likely to hit real"
+            echo "kernel-API changes (not just missing headers) against a kernel this old — those"
+            echo "require actual source patches this script won't safely auto-generate."
+            echo
+            echo "Recommended: update this Pi's kernel first (routine apt update, not a reinstall):"
+            echo "    sudo apt update && sudo apt full-upgrade -y && sudo reboot"
+            echo "Then re-run ./run.sh."
+            echo
+            read -r -p "Continue anyway with the current kernel? [y/N] " KERNEL_AGE_REPLY
+            case "$KERNEL_AGE_REPLY" in
+                [Yy]*) warn "Continuing at your request — expect possible manual source patching if the build hits real API mismatches." ;;
+                *) die "Stopping. Update the kernel and re-run ./run.sh." ;;
+            esac
+        fi
+    fi
+fi
+
 log "USB device check (expect PCTV 461 / 2013:0462):"
 if command -v lsusb >/dev/null 2>&1; then
     lsusb -d 2013:0462 | tee -a "$LOG_FILE" || warn "Device 2013:0462 not currently visible via lsusb. Plug it in before continuing."
@@ -204,6 +241,42 @@ DVBFE_DIR="${SRC_DIR}/drivers/media/dvb-frontends"
 [ -d "$EM28XX_DIR" ] || die "em28xx source directory missing after checkout."
 [ -d "$DVBFE_DIR" ] || die "dvb-frontends source directory missing after checkout."
 
+# ---------------------------------------------------------------------
+# kzalloc_obj / kzalloc_objs are newer allocator convenience macros that
+# are STILL CHANGING SHAPE as they move through kernel development -
+# their argument counts differ even between nearby point releases of the
+# same kernel branch (e.g. 6.18.34 vs 6.18.39), so pinning to any single
+# mainline commit can't reliably match every installed kernel's exact
+# version of them. Rather than chase that, rewrite any use of them to
+# the explicit, decades-stable primitives they're shorthand for:
+#     kzalloc_obj(EXPR)          -> kzalloc(sizeof(EXPR), GFP_KERNEL)
+#     kzalloc_obj(EXPR, FLAGS)   -> kzalloc(sizeof(EXPR), FLAGS)
+#     kzalloc_objs(EXPR, N)      -> kcalloc(N, sizeof(EXPR), GFP_KERNEL)
+#     kzalloc_objs(EXPR, N, FL)  -> kcalloc(N, sizeof(EXPR), FL)
+# These are purely mechanical, semantically-identical substitutions (not
+# behavior changes), applied to any fetched .c file before it's built.
+# If a future error names a DIFFERENT macro in this same "_obj(s)" family
+# (e.g. kmalloc_obj, vzalloc_obj), the same substitution pattern applies -
+# tell me the macro name and its stable-form equivalent (check
+# include/linux/slab.h on the failing kernel for what it expands to) and
+# I'll add it here the same way.
+# ---------------------------------------------------------------------
+normalize_kzalloc_obj() {
+    for f in "$@"; do
+        [ -f "$f" ] || continue
+        grep -qE 'kzalloc_objs?\(' "$f" || continue
+        log "Normalizing kzalloc_obj()/kzalloc_objs() calls in $(basename "$f") to stable kzalloc()/kcalloc() form..."
+        # kzalloc_objs: array form (check this BEFORE kzalloc_obj, since
+        # "kzalloc_obj" is a prefix of "kzalloc_objs" and would otherwise
+        # partially match first)
+        sed -i -E 's/kzalloc_objs\(([^,()]+),[[:space:]]*([^,()]+),[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)\)/kcalloc(\2, sizeof(\1), \3)/g' "$f"
+        sed -i -E 's/kzalloc_objs\(([^,()]+),[[:space:]]*([^,()]+)\)/kcalloc(\2, sizeof(\1), GFP_KERNEL)/g' "$f"
+        # kzalloc_obj: single-object form
+        sed -i -E 's/kzalloc_obj\(([^,()]+),[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)\)/kzalloc(sizeof(\1), \2)/g' "$f"
+        sed -i -E 's/kzalloc_obj\(([^,()]+)\)/kzalloc(sizeof(\1), GFP_KERNEL)/g' "$f"
+    done
+}
+
 log "Confirming the fetched source actually contains the 461e v3 / M88DS3103C support..."
 HAVE_461E_V3=0
 HAVE_3103C=0
@@ -239,6 +312,8 @@ ls "$STAGE_DVBFE"/m88ds3103*.c >/dev/null 2>&1 || die "m88ds3103 source missing 
 ls "$STAGE_DVBFE"/ts2020*.c    >/dev/null 2>&1 || die "ts2020 source missing from fetched tree."
 ls "$STAGE_DVBFE"/a8293*.c     >/dev/null 2>&1 || die "a8293 source missing from fetched tree."
 
+normalize_kzalloc_obj "$STAGE_DVBFE"/*.c
+
 cat > "$STAGE_DVBFE/Makefile" <<'MAKEFILE_EOF'
 obj-m += m88ds3103.o
 obj-m += ts2020.o
@@ -252,6 +327,7 @@ make -C "$KDIR" M="$STAGE_DVBFE" modules \
 DVBFE_DIR="$STAGE_DVBFE"   # downstream steps read .ko files from here now
 
 log "Building em28xx (core + dvb extension) against ${RUNNING_KERNEL}..."
+normalize_kzalloc_obj "$EM28XX_DIR"/*.c
 # em28xx.h / em28xx-dvb.c reference several headers outside their own
 # directory (newer generic kernel headers, and quoted includes of various
 # DVB frontend/tuner headers for the many boards em28xx supports). All
@@ -331,4 +407,3 @@ echo
 echo "Full log saved to: ${LOG_FILE}"
 echo "Known-good mainline commit pinned at: ${KNOWN_GOOD_COMMIT_FILE}"
 echo "  (back this file up — copying it to a fresh Pi and re-running ./run.sh"
-echo "   reproduces this exact working build, unaffected by future mainline changes)"
